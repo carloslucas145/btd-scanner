@@ -1,0 +1,20 @@
+services:
+  - type: cron
+    name: btd-scanner
+    runtime: python
+    schedule: "30 21 * * 1-5"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python btd_scanner.py
+    envVars:
+      - key: BTD_EMAIL_FROM
+        sync: false
+      - key: BTD_EMAIL_TO
+        sync: false
+      - key: BTD_EMAIL_USER
+        sync: false
+      - key: BTD_EMAIL_PASSWORD
+        sync: false
+      - key: BTD_TELEGRAM_TOKEN
+        sync: false
+      - key: BTD_TELEGRAM_CHAT_ID
+        sync: false
