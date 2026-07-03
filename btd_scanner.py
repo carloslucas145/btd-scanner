@@ -48,6 +48,11 @@ TICKERS = [
 
 RECALIBRAR_CADA_N_SESIONES = 10
 
+# ── Robustez de la calibración (anti-sobreajuste / anti-PF-explotado) ──
+MIN_SIGNALS    = 6     # mínimo de operaciones en el backtest para fiarnos de una combinación
+MIN_PERDEDORAS = 2     # mínimo de operaciones PERDEDORAS (sin pérdidas reales el PF no es fiable)
+PF_DISPLAY_CAP = 99.0  # tope de visualización del profit factor (por seguridad; ya no debería alcanzarse)
+
 def log(msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
@@ -127,26 +132,40 @@ def backtest_xyz(prices, X, Y, Z, window=10, max_hold=20):
             if not closed:
                 returns.append(float((p[i+max_hold] - entry) / entry * 100))
                 signals += 1
-    if signals < 3:
+    if signals < MIN_SIGNALS:
         return None
+    n_perdedoras = sum(1 for r in returns if r < 0)
     wr        = float(wins) / float(signals)
     ganancias = float(sum(r for r in returns if r > 0))
-    perdidas  = float(abs(sum(r for r in returns if r < 0))) or 0.001
+    perdidas  = float(abs(sum(r for r in returns if r < 0))) or 1e-9
     total_ret = float(sum(returns))
+    # PF acotado: con MIN_PERDEDORAS>=2 el denominador es real y no explota;
+    # el tope es solo un cinturón de seguridad para la visualización.
+    pf = round(min(ganancias / perdidas, PF_DISPLAY_CAP), 4)
     return {
         'signals': signals,
+        'n_perdedoras': n_perdedoras,
         'win_rate': round(wr, 4),
-        'profit_factor': round(ganancias / perdidas, 4),
+        'profit_factor': pf,
+        'expectancy': round(total_ret / signals, 3),   # retorno medio por operación (%)
         'total_return': round(total_ret, 2)
     }
 
 def optimizar_xyz(prices):
-    best, best_params = None, None
+    best, best_params, best_key = None, None, None
     for X, Y, Z in product(range(7,16), [3,4,5,6,7,8,9,10,12,15], range(3,11)):
         r = backtest_xyz(prices, X, Y, Z)
-        if r and r['win_rate'] >= 0.45:
-            if best is None or r['profit_factor'] > best['profit_factor']:
-                best = r; best_params = (X, Y, Z)
+        if not r:
+            continue
+        if r['win_rate'] < 0.45:
+            continue
+        # Descarta combinaciones sin pérdidas reales: su PF no es fiable (sobreajuste).
+        if r['n_perdedoras'] < MIN_PERDEDORAS:
+            continue
+        # Ranking honesto: mayor PF; a igualdad, más operaciones (más fiable) y más retorno.
+        key = (r['profit_factor'], r['signals'], r['total_return'])
+        if best_key is None or key > best_key:
+            best_key, best, best_params = key, r, (X, Y, Z)
     return best_params, best
 
 def calibrar_todos():
@@ -165,6 +184,8 @@ def calibrar_todos():
                 'win_rate': stats['win_rate'],
                 'profit_factor': stats['profit_factor'],
                 'signals': stats['signals'],
+                'n_perdedoras': stats['n_perdedoras'],
+                'expectancy': stats['expectancy'],
                 'total_return': stats['total_return']
             }
             log(f"  ✓ {ticker}: X={params[0]}% Y={params[1]}% Z={params[2]}% | "
