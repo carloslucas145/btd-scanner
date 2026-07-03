@@ -3,11 +3,17 @@
   BUY THE DIP SCANNER — NASDAQ-100
   Modo completo: datos reales + email HTML + Telegram
   Filtro SMA 200: solo señales donde precio > SMA(200)
+  Filtro TP mínimo: solo señales con objetivo Y >= TP_MIN  (nuevo)
 ═══════════════════════════════════════════════════════
   Uso:
     python btd_scanner.py              → escáner diario
     python btd_scanner.py --calibrar   → fuerza recalibración XYZ
     python btd_scanner.py --test       → modo test (no envía)
+
+  Filtro TP:
+    - Variable de entorno BTD_TP_MIN (ej. 7) en Render, o "tp_min" en config.json.
+    - Por defecto 7: descarta señales cuyo objetivo de beneficio sea < 7%.
+    - Poner 0 lo desactiva (comportamiento antiguo).
 """
 
 import yfinance as yf
@@ -24,6 +30,8 @@ CFG_FILE    = Path("config.json")
 PARAMS_FILE = Path("parametros_xyz.json")
 HIST_FILE   = Path("historico_señales.csv")
 LOG_FILE    = Path("btd_log.txt")
+
+TP_MIN_DEFAULT = 7.0   # objetivo de beneficio mínimo (%) para aceptar una señal
 
 TICKERS = [
     'NVDA','AAPL','MSFT','AMZN','GOOGL','GOOG','META','AVGO','TSLA','COST',
@@ -62,13 +70,16 @@ def cargar_config():
                 "token":   os.environ.get("BTD_TELEGRAM_TOKEN", ""),
                 "chat_id": os.environ.get("BTD_TELEGRAM_CHAT_ID", "")
             },
-            "filtro_sma200": True
+            "filtro_sma200": True,
+            "tp_min": float(os.environ.get("BTD_TP_MIN", str(TP_MIN_DEFAULT)))
         }
     # Modo local: lee config.json
     if not CFG_FILE.exists():
         log("ERROR: No existe config.json. Ejecuta: python btd_scanner.py --setup")
         sys.exit(1)
-    return json.loads(CFG_FILE.read_text())
+    cfg = json.loads(CFG_FILE.read_text())
+    cfg.setdefault("tp_min", TP_MIN_DEFAULT)
+    return cfg
 
 def sesiones_desde_calibracion():
     if not PARAMS_FILE.exists():
@@ -175,11 +186,19 @@ def precio_sobre_sma200(prices):
     precio_actual = float(arr[-1])
     return precio_actual > sma200
 
-def escanear(params_xyz, filtro_sma200=True):
+def escanear(params_xyz, filtro_sma200=True, tp_min=0.0):
     log("═══ Escaneando señales activas hoy ═══")
+    if tp_min > 0:
+        log(f"Filtro TP: solo señales con objetivo Y >= {tp_min}%")
     oportunidades = []
     tickers_validos = params_xyz.get('tickers', {})
+    n_filtrados_tp = 0
     for ticker, r in tickers_validos.items():
+        # ── Filtro TP mínimo: descarta objetivos pequeños (bajo R/R) ──
+        # El objetivo de beneficio es exactamente r['Y'] (Take_Profit = precio*(1+Y/100)).
+        if tp_min > 0 and r.get('Y', 0) < tp_min:
+            n_filtrados_tp += 1
+            continue
         prices = descargar_precios(ticker, dias=260)
         if prices is None or len(prices) < 12:
             continue
@@ -209,6 +228,8 @@ def escanear(params_xyz, filtro_sma200=True):
                 'Fecha':         datetime.today().strftime("%Y-%m-%d")
             })
             log(f"  🔔 {ticker}: caída {caida:.1f}% ≥ X={r['X']}% → SEÑAL ACTIVA")
+    if tp_min > 0 and n_filtrados_tp:
+        log(f"  (Filtro TP≥{tp_min}%: {n_filtrados_tp} tickers descartados por objetivo pequeño)")
     oportunidades.sort(key=lambda x: x['Profit_Factor'], reverse=True)
     log(f"═══ {len(oportunidades)} señales activas ═══")
     return oportunidades
@@ -236,7 +257,8 @@ def cargar_señales_ayer():
     df_ayer = df[df['Fecha'] == ayer]
     return df_ayer if not df_ayer.empty else None
 
-def construir_email_html(señales, nuevas, fecha):
+def construir_email_html(señales, nuevas, fecha, tp_min=0.0):
+    filtro_txt = f" · Filtro TP≥{tp_min:g}%" if tp_min > 0 else ""
     filas = ""
     for s in señales:
         es_nueva = s['Ticker'] in [n['Ticker'] for n in nuevas]
@@ -277,7 +299,7 @@ def construir_email_html(señales, nuevas, fecha):
 <body style="background:#171614;color:#cdccca;font-family:'Helvetica Neue',Arial,sans-serif;margin:0;padding:0">
   <div style="max-width:900px;margin:0 auto;padding:32px 16px">
     <h1 style="font-size:28px;margin-bottom:4px">📊 Buy the Dip Scanner</h1>
-    <p style="color:#797876;margin-bottom:24px">NASDAQ-100 · {fecha} · Filtro SMA200 activo</p>
+    <p style="color:#797876;margin-bottom:24px">NASDAQ-100 · {fecha} · Filtro SMA200 activo{filtro_txt}</p>
     {resumen}
     <h2 style="font-size:18px;margin:24px 0 12px">🚨 Señales activas hoy ({len(señales)})</h2>
     <div style="background:#1c1b19;border-radius:16px;padding:16px;overflow:auto">{tabla}</div>
@@ -317,14 +339,17 @@ def enviar_email(html, señales, nuevas, cfg, test=False):
     except Exception as e:
         log(f"  ✗ Error enviando email: {e}")
 
-def enviar_telegram(señales, nuevas, cfg, test=False):
+def enviar_telegram(señales, nuevas, cfg, test=False, tp_min=0.0):
     tg = cfg.get("telegram", {})
     if not tg.get("token") or not tg.get("chat_id"):
         log("  ⚠ Telegram no configurado. Saltando.")
         return
     n = len(señales); n_new = len(nuevas)
     fecha = datetime.today().strftime("%d/%m/%Y")
-    lineas = [f"*📊 Buy the Dip Scanner — {fecha}*", f"NASDAQ-100 · Filtro SMA200 activo\n"]
+    cab = "NASDAQ-100 · Filtro SMA200 activo"
+    if tp_min > 0:
+        cab += f" · TP≥{tp_min:g}%"
+    lineas = [f"*📊 Buy the Dip Scanner — {fecha}*", cab + "\n"]
     if n == 0:
         lineas.append("No hay señales activas hoy.")
     else:
@@ -372,6 +397,11 @@ def setup_interactivo():
     cfg["telegram"] = {"token": token, "chat_id": chat_id}
     sma200 = input("\n  ¿Activar filtro SMA200? (recomendado) [S/n]: ").strip().lower()
     cfg["filtro_sma200"] = sma200 != "n"
+    tp = input(f"  Objetivo TP mínimo en %% (Enter = {TP_MIN_DEFAULT:g}, 0 = sin filtro): ").strip()
+    try:
+        cfg["tp_min"] = float(tp) if tp else TP_MIN_DEFAULT
+    except ValueError:
+        cfg["tp_min"] = TP_MIN_DEFAULT
     CFG_FILE.write_text(json.dumps(cfg, indent=2))
     print(f"\n✅ Config guardada en {CFG_FILE}")
     print("  Siguiente paso: python btd_scanner.py --calibrar\n")
@@ -382,12 +412,16 @@ def main():
     parser.add_argument("--test",     action="store_true")
     parser.add_argument("--setup",    action="store_true")
     parser.add_argument("--sin-sma",  action="store_true")
+    parser.add_argument("--tp-min",   type=float, default=None,
+                        help="Objetivo TP mínimo en %% (sobrescribe config/env; 0 = sin filtro)")
     args = parser.parse_args()
     if args.setup:
         setup_interactivo(); return
     cfg = cargar_config()
     usar_sma200 = cfg.get("filtro_sma200", True) and not args.sin_sma
+    tp_min = args.tp_min if args.tp_min is not None else cfg.get("tp_min", TP_MIN_DEFAULT)
     log(f"Filtro SMA200: {'ACTIVO' if usar_sma200 else 'INACTIVO'}")
+    log(f"Filtro TP mínimo: {tp_min:g}%" if tp_min > 0 else "Filtro TP mínimo: INACTIVO")
     sesiones = sesiones_desde_calibracion()
     if args.calibrar or sesiones >= RECALIBRAR_CADA_N_SESIONES:
         log(f"Recalibrando ({sesiones} sesiones desde última calibración)...")
@@ -400,15 +434,15 @@ def main():
     params_xyz = json.loads(PARAMS_FILE.read_text())
     fecha = datetime.today().strftime("%Y-%m-%d")
     señales_ayer = cargar_señales_ayer()
-    señales_hoy  = escanear(params_xyz, filtro_sma200=usar_sma200)
+    señales_hoy  = escanear(params_xyz, filtro_sma200=usar_sma200, tp_min=tp_min)
     nuevas        = señales_nuevas(señales_hoy, señales_ayer)
     if señales_hoy:
         guardar_historico(señales_hoy)
         pd.DataFrame(señales_hoy).to_csv(f"señales_{fecha}.csv", index=False)
         log(f"CSV guardado: señales_{fecha}.csv")
-    html = construir_email_html(señales_hoy, nuevas, fecha)
+    html = construir_email_html(señales_hoy, nuevas, fecha, tp_min=tp_min)
     enviar_email(html, señales_hoy, nuevas, cfg, test=args.test)
-    enviar_telegram(señales_hoy, nuevas, cfg, test=args.test)
+    enviar_telegram(señales_hoy, nuevas, cfg, test=args.test, tp_min=tp_min)
     log("═══ Ejecución completada ═══\n")
 
 if __name__ == "__main__":
